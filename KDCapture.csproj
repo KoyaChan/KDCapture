@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>KDCapture</AssemblyName>
+    <RootNamespace>KDCapture</RootNamespace>
+    <LangVersion>9</LangVersion>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+
+  <!--
+    Required debugger binaries can be placed either:
+      1) under Resources\
+      2) at project root (fallback for existing local layout)
+  -->
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\kd.exe"      LogicalName="kd.exe"      Condition="Exists('Resources\kd.exe')" />
+    <EmbeddedResource Include="Resources\dbgeng.dll"  LogicalName="dbgeng.dll"  Condition="Exists('Resources\dbgeng.dll')" />
+    <EmbeddedResource Include="Resources\dbghelp.dll" LogicalName="dbghelp.dll" Condition="Exists('Resources\dbghelp.dll')" />
+    <EmbeddedResource Include="Resources\dbgcore.dll" LogicalName="dbgcore.dll" Condition="Exists('Resources\dbgcore.dll')" />
+    <EmbeddedResource Include="Resources\EngHost.exe" LogicalName="EngHost.exe" Condition="Exists('Resources\EngHost.exe')" />
+
+    <EmbeddedResource Include="kd.exe"      LogicalName="kd.exe"      Condition="!Exists('Resources\kd.exe') and Exists('kd.exe')" />
+    <EmbeddedResource Include="dbgeng.dll"  LogicalName="dbgeng.dll"  Condition="!Exists('Resources\dbgeng.dll') and Exists('dbgeng.dll')" />
+    <EmbeddedResource Include="dbghelp.dll" LogicalName="dbghelp.dll" Condition="!Exists('Resources\dbghelp.dll') and Exists('dbghelp.dll')" />
+    <EmbeddedResource Include="dbgcore.dll" LogicalName="dbgcore.dll" Condition="!Exists('Resources\dbgcore.dll') and Exists('dbgcore.dll')" />
+    <EmbeddedResource Include="EngHost.exe" LogicalName="EngHost.exe" Condition="!Exists('Resources\EngHost.exe') and Exists('EngHost.exe')" />
+  </ItemGroup>
+
+</Project>
