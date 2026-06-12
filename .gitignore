@@ -1,0 +1,20 @@
+# Build output
+bin/
+obj/
+
+# Visual Studio local files
+.vs/
+*.user
+*.suo
+
+# Debugger binaries (do not commit)
+kd.exe
+EngHost.exe
+dbgeng.dll
+dbghelp.dll
+dbgcore.dll
+Resources/kd.exe
+Resources/EngHost.exe
+Resources/dbgeng.dll
+Resources/dbghelp.dll
+Resources/dbgcore.dll

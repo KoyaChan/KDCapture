@@ -7,6 +7,33 @@ KDCapture is a lightweight utility that automates remote kernel dump capture fro
 It is designed for incident investigation when a DR workflow becomes unresponsive and interactive debugging is difficult in field environments.
 Instead of manually operating kd command sequences, KDCapture performs the connection and dump workflow in a repeatable way, with logging for traceability.
 
+## Prerequisites
+
+### Host machine (where KDCapture runs)
+- Windows x64
+- .NET Framework 4.8 or later
+  - Windows Server 2022: usually preinstalled
+  - Windows Server 2019 or earlier: verify and install if needed
+- Administrator privilege (recommended for KD-related operations)
+- Inbound UDP port for KDNET (for example, UDP 50000) allowed on Windows Firewall
+
+Check .NET Framework release value:
+
+```cmd
+reg query "HKLM\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" /v Release
+```
+
+If `Release` is `528040` or higher, .NET Framework 4.8 or later is installed.
+
+### Required debugger binaries
+This repository does not include debugger binaries such as `kd.exe`, `dbgeng.dll`, `dbghelp.dll`, `dbgcore.dll`, and `EngHost.exe`.
+Before building KDCapture, place these binaries in the project folder (`KDCapture.csproj` directory) or under `Resources\` in the same project.
+They are embedded at build time and required to produce a working executable.
+
+### Target machine (WinPE)
+- WinPE booted target with KDNET enabled (`bcdedit /dbgsettings net ...` and debug enabled)
+- Network reachability from target WinPE to host KDNET port
+
 ## Usage
 
 ### 目的
