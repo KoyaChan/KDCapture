@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace KDCapture
@@ -12,15 +13,27 @@ namespace KDCapture
     {
         private static readonly object LogLock = new object();
         private static readonly object KdNoiseLock = new object();
+        // true: write a complete memory dump (.dump /f). false: kernel summary dump (.dump /k, default).
+        private static bool FullDumpMode;
         private static StreamWriter LogWriter;
         private static int ValidateSequenceSuppressedCount;
         private static DateTime ValidateSequenceLastSummaryUtc = DateTime.MinValue;
 
         private static int Main(string[] args)
         {
+            // Helper mode: attach to kd.exe's console and send Ctrl+C (= kernel break-in).
+            if (args.Length == 2 && args[0].Equals("--send-ctrlc", StringComparison.OrdinalIgnoreCase))
+            {
+                return int.TryParse(args[1], out var kdPid) ? SendCtrlCToConsoleOf(kdPid) : 2;
+            }
+
+            // kd.exe runs in its own hidden console, so Ctrl+C here does not reach it. Kill it explicitly.
+            Console.CancelKeyPress += (_, __) => KillCurrentKd();
+
             try
             {
                 var options = ParseArgs(args);
+                FullDumpMode = options.FullDump;
 
                 if (options.ShowHelp)
                 {
@@ -67,6 +80,7 @@ namespace KDCapture
                 }
 
                 InitializeLogger(options, outputFullPath);
+                Info("Dump type: " + (FullDumpMode ? "complete memory (.dump /f)" : "kernel summary (.dump /k)"));
 
                 if (string.IsNullOrWhiteSpace(options.TargetIp))
                 {
@@ -84,6 +98,12 @@ namespace KDCapture
                     if (!File.Exists(kdPath))
                     {
                         throw new FileNotFoundException("kd.exe was not found in embedded resources.");
+                    }
+
+                    if (options.ManualTrigger)
+                    {
+                        // Operator decides when to capture (e.g. during restore, and again after freeze).
+                        return RunManualMode(options, kdPath, outputFullPath);
                     }
 
                     if (options.LoopMode || options.DelayBeforeDumpSec > 0)
@@ -226,6 +246,79 @@ namespace KDCapture
             }
         }
 
+        private static int RunManualMode(Options options, string kdPath, string outputFullPath)
+        {
+            var kdTarget = BuildKdTarget(options);
+            var outputDir = Path.GetDirectoryName(outputFullPath) ?? Environment.CurrentDirectory;
+            var baseName = Path.GetFileNameWithoutExtension(outputFullPath);
+            var extension = Path.GetExtension(outputFullPath);
+            if (string.IsNullOrEmpty(extension))
+            {
+                extension = ".dmp";
+            }
+
+            var attempt = 0;
+            var successCount = 0;
+
+            Info("Manual trigger mode enabled.");
+            Info("Target           : " + kdTarget);
+            Info("Dump folder      : " + outputDir);
+            Info("Timeout(sec)     : " + options.CaptureTimeoutSec);
+            Info("NoDebuggeeTimeout(sec): " + options.NoDebuggeeTimeoutSec);
+
+            while (true)
+            {
+                Console.WriteLine();
+                Console.WriteLine("Press Enter to capture a " + (FullDumpMode ? "complete memory" : "kernel") + " dump now.");
+                Console.WriteLine("  You may type a short note before Enter (e.g. \"restore 4% frozen\").");
+                Console.WriteLine("  Type q and press Enter to quit.");
+                Console.Write("> ");
+
+                var input = Console.ReadLine();
+                if (input == null)
+                {
+                    Info("Console input closed. Exiting manual mode.");
+                    break;
+                }
+
+                input = input.Trim();
+                if (input.Equals("q", StringComparison.OrdinalIgnoreCase) ||
+                    input.Equals("quit", StringComparison.OrdinalIgnoreCase))
+                {
+                    Info("Quit requested by operator.");
+                    break;
+                }
+
+                attempt++;
+                var dumpPath = Path.Combine(
+                    outputDir,
+                    baseName + "_" + attempt.ToString("00") + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + extension);
+
+                Info("Manual capture #" + attempt + " triggered. Note: " + (input.Length > 0 ? input : "(none)"));
+
+                var result = ExecuteSingleCapture(
+                    kdPath,
+                    kdTarget,
+                    dumpPath,
+                    options.CaptureTimeoutSec,
+                    options.NoDebuggeeTimeoutSec,
+                    0);
+
+                if (result == 0)
+                {
+                    successCount++;
+                    Info("Manual capture #" + attempt + " succeeded. Target has been resumed (qd).");
+                }
+                else
+                {
+                    Error("Manual capture #" + attempt + " failed (code=" + result + "). You can press Enter to retry.");
+                }
+            }
+
+            Info("Manual mode finished. Successful dumps: " + successCount + " / attempts: " + attempt);
+            return successCount > 0 ? 0 : 1;
+        }
+
         private static int ExecuteSingleCapture(
             string kdPath,
             string kdTarget,
@@ -238,9 +331,10 @@ namespace KDCapture
             ResetKdNoiseSummaryState();
             
             // Capture dump and then quit+detach gracefully so next KDCapture run can reconnect cleanly.
-            var kdCommand = ".dump /k \"" + dumpPath + "\";qd";
+            var kdCommand = ".dump " + (FullDumpMode ? "/f" : "/k") + " \"" + dumpPath + "\";qd";
             var kdArgs = "-b -k " + kdTarget + " -c \"" + kdCommand + "\"";
             long noDebuggeeSinceTicksUtc = 0;
+            long targetSeenTicksUtc = 0;
             bool connectionEstablished = false;
 
             if (delayBeforeDumpSec > 0)
@@ -287,6 +381,11 @@ namespace KDCapture
 
                         Info(e.Data);
 
+                        if (e.Data.IndexOf("Connected to target", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            Interlocked.CompareExchange(ref targetSeenTicksUtc, DateTime.UtcNow.Ticks, 0);
+                        }
+
                         if (e.Data.IndexOf("Kernel Debugger connection established", StringComparison.OrdinalIgnoreCase) >= 0)
                         {
                             connectionEstablished = true;
@@ -309,17 +408,36 @@ namespace KDCapture
                 };
 
                 process.Start();
+                CurrentKdProcess = process;
                 process.BeginOutputReadLine();
                 process.BeginErrorReadLine();
 
                 var captureDeadlineUtc = DateTime.UtcNow.AddSeconds(captureTimeoutSec);
                 long lastDumpBytes = -1;
+                var lastBreakInUtc = DateTime.MinValue;
+                var breakInCount = 0;
 
                 while (true)
                 {
                     if (process.WaitForExit(500))
                     {
                         break;
+                    }
+
+                    // "-b" alone does not break in: the session only completes when the target hits a debug event,
+                    // which never happens on a frozen target. Send Ctrl+C (break-in) like an operator would.
+                    var targetSeenTicks = Interlocked.Read(ref targetSeenTicksUtc);
+                    if (!connectionEstablished && targetSeenTicks != 0)
+                    {
+                        var sinceTargetSeenSec = (DateTime.UtcNow - new DateTime(targetSeenTicks, DateTimeKind.Utc)).TotalSeconds;
+                        if (sinceTargetSeenSec >= BreakInFirstDelaySec &&
+                            (DateTime.UtcNow - lastBreakInUtc).TotalSeconds >= BreakInRetrySec)
+                        {
+                            breakInCount++;
+                            lastBreakInUtc = DateTime.UtcNow;
+                            Info("Sending break-in (Ctrl+C) to kd.exe... (#" + breakInCount + ")");
+                            SendBreakIn(process.Id);
+                        }
                     }
 
                     if (File.Exists(dumpPath))
@@ -369,6 +487,8 @@ namespace KDCapture
                     }
                 }
 
+                CurrentKdProcess = null;
+
                 if (process.ExitCode != 0)
                 {
                     FlushKdNoiseSummary();
@@ -391,6 +511,81 @@ namespace KDCapture
             }
 
             return 0;
+        }
+
+        private const int BreakInFirstDelaySec = 2;
+        private const int BreakInRetrySec = 15;
+        private const uint CTRL_C_EVENT = 0;
+        private static volatile Process CurrentKdProcess;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool FreeConsole();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AttachConsole(uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetConsoleCtrlHandler(IntPtr handlerRoutine, bool add);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);
+
+        private static void SendBreakIn(int kdPid)
+        {
+            // Done in a child process so that this process never detaches from its own console.
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = Process.GetCurrentProcess().MainModule.FileName,
+                    Arguments = "--send-ctrlc " + kdPid,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+
+                using (var helper = Process.Start(psi))
+                {
+                    if (helper == null || !helper.WaitForExit(5000))
+                    {
+                        Error("Break-in helper did not finish in time.");
+                        return;
+                    }
+
+                    if (helper.ExitCode != 0)
+                    {
+                        Error("Break-in helper failed (code=" + helper.ExitCode + ").");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Error("Failed to send break-in: " + ex.Message);
+            }
+        }
+
+        private static int SendCtrlCToConsoleOf(int kdPid)
+        {
+            FreeConsole();
+            if (!AttachConsole((uint)kdPid))
+            {
+                return 3;
+            }
+
+            // Ignore the Ctrl+C in this helper; only kd.exe should react to it.
+            SetConsoleCtrlHandler(IntPtr.Zero, true);
+            var ok = GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
+            Thread.Sleep(500);
+            FreeConsole();
+            return ok ? 0 : 4;
+        }
+
+        private static void KillCurrentKd()
+        {
+            var kd = CurrentKdProcess;
+            if (kd != null)
+            {
+                TryKillProcess(kd);
+            }
         }
 
         private static bool TrySummarizeKdNoiseLine(string line)
@@ -672,6 +867,8 @@ namespace KDCapture
                 ["--target"] = v => options.TargetIp = v,
                 ["--targetip"] = v => options.TargetIp = v,
                 ["--loop"] = _ => options.LoopMode = true,
+                ["--manual"] = _ => options.ManualTrigger = true,
+                ["--full"] = _ => options.FullDump = true,
                 ["--interval-sec"] = v => options.IntervalSec = int.TryParse(v, out var s) ? s : 0,
                 ["--capture-timeout-sec"] = v => options.CaptureTimeoutSec = int.TryParse(v, out var t) ? t : 0,
                 ["--no-debuggee-timeout-sec"] = v => options.NoDebuggeeTimeoutSec = int.TryParse(v, out var t) ? t : 0,
@@ -704,7 +901,9 @@ namespace KDCapture
                     continue;
                 }
 
-                if (arg.Equals("--loop", StringComparison.OrdinalIgnoreCase) ||
+                if (arg.Equals("--full", StringComparison.OrdinalIgnoreCase) ||
+                    arg.Equals("--loop", StringComparison.OrdinalIgnoreCase) ||
+                    arg.Equals("--manual", StringComparison.OrdinalIgnoreCase) ||
                     arg.Equals("-l", StringComparison.OrdinalIgnoreCase))
                 {
                     setter(string.Empty);
@@ -727,8 +926,12 @@ namespace KDCapture
             Console.WriteLine("KDCapture usage:");
             Console.WriteLine("  single: KDCapture.exe --key <KDNET_KEY> --port <PORT> --output <DUMP_PATH> [--targetip <TARGET_IP>] [--delay-before-dump-sec 480] [--log <LOG_PATH>]");
             Console.WriteLine("  loop  : KDCapture.exe --key <KDNET_KEY> --port <PORT> --output <DUMP_PATH> --loop [--interval-sec 30] [--capture-timeout-sec 20] [--no-debuggee-timeout-sec 30] [--delay-before-dump-sec 480] [--targetip <TARGET_IP>] [--log <LOG_PATH>]");
+            Console.WriteLine("  manual: KDCapture.exe --key <KDNET_KEY> --port <PORT> --output <DUMP_PATH> --manual [--targetip <TARGET_IP>] [--capture-timeout-sec 300] [--log <LOG_PATH>]");
+            Console.WriteLine();
+            Console.WriteLine("  add --full to any mode to write a complete memory dump (.dump /f) instead of a kernel summary (.dump /k). Much larger and slower to write.");
             Console.WriteLine();
             Console.WriteLine("Notes:");
+            Console.WriteLine("  - --manual waits for Enter, then breaks in and dumps; repeat as needed (q to quit). Dump names get _NN_<time> suffix.");
             Console.WriteLine("  - If --log is omitted, default log path is <output>.log");
             Console.WriteLine("  - --targetip is strongly recommended for KDNET stability (maps to net:...target=<TARGET_IP>)");
             Console.WriteLine("  - delay-before-dump-sec controls when KDCapture sends .breakin and starts the dump (0 = dump immediately after attach)");
@@ -745,6 +948,8 @@ namespace KDCapture
             public string OutputPath { get; set; }
             public string TargetIp { get; set; }
             public bool LoopMode { get; set; }
+            public bool ManualTrigger { get; set; }
+            public bool FullDump { get; set; }
             public int IntervalSec { get; set; } = 30;
             public int CaptureTimeoutSec { get; set; } = 20;
             public int NoDebuggeeTimeoutSec { get; set; } = 30;
